@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+venv/
+
+# Python
+__pycache__/
+
+# Environment variables
+.env
+
+# Database
+*.db
+
+# Next.js
+.next/
+
+# macOS
+.DS_Store

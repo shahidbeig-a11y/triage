@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+sqlalchemy
+anthropic
+msal
+httpx
+python-dotenv
