@@ -1,18 +1,46 @@
-# Dependencies
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+.yarn/install-state.gz
 node_modules/
-venv/
 
-# Python
-__pycache__/
+# testing
+/coverage
 
-# Environment variables
+# next.js
+/.next/
+/out/
+.next/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
 .env
+.env*.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# Python (if backend is in same repo)
+venv/
+__pycache__/
 
 # Database
 *.db
-
-# Next.js
-.next/
-
-# macOS
-.DS_Store

@@ -23,6 +23,8 @@ npm install
 npm run dev
 ```
 
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+
 ### Backend
 ```bash
 cd backend
@@ -32,6 +34,8 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
+The backend API will be available at [http://localhost:8000](http://localhost:8000).
+
 ## Project Status
 
 **Week 1**: Scaffolding complete
@@ -39,3 +43,12 @@ uvicorn main:app --reload
 - Microsoft Graph API authentication implemented
 - Email fetch functionality integrated
 - Development environment configured
+- Dark theme dashboard with Work, Insights, and Settings tabs
+- Email triage interface with Outlook integration
+
+## Learn More
+
+To learn more about Next.js, take a look at the following resources:
+
+- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
+- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
