@@ -10,6 +10,44 @@ FastAPI backend for intelligent email triage and classification using Claude AI 
 - **User Settings**: Customizable thresholds and preferences
 - **RESTful API**: Clean API design with automatic OpenAPI documentation
 
+## Project Status
+
+### Week 3: Urgency Scoring Engine ✓
+
+**Status**: Checkpoint P1-A (Classification + Scoring Engine) PASSED
+
+Completed urgency scoring engine with comprehensive signal extraction and safety mechanisms:
+
+- **8 Signal Extractors**:
+  - Deadline proximity detection
+  - Executive sender identification
+  - Thread depth analysis
+  - Time-sensitive keyword detection
+  - Question density measurement
+  - Call-to-action (CTA) pattern recognition
+  - SLA/timeline extraction
+  - Escalation language detection
+
+- **Safety Mechanisms**:
+  - **Urgency Floor** (default 0.3): Ensures all emails maintain minimum urgency to prevent task loss
+  - **Stale Escalation**: Auto-escalates emails older than 48h without response
+
+- **Assignment System**: Batch assignment of top N emails to Microsoft To-Do based on urgency scores
+
+- **Microsoft To-Do Integration**:
+  - Bidirectional sync with To-Do tasks
+  - Duplicate detection and cleanup
+  - Task completion tracking
+  - Email-to-task linking with custom IDs
+
+- **API Endpoints**:
+  - `/api/emails/{id}/score` - Calculate urgency score for single email
+  - `/api/emails/batch/score` - Score multiple emails
+  - `/api/emails/batch/assign` - Assign top N emails to To-Do
+  - `/api/emails/todo/sync` - Sync with Microsoft To-Do tasks
+
+**Next Phase**: Frontend integration and P2 priority features
+
 ## Project Structure
 
 ```
@@ -207,18 +245,25 @@ isort app/
 
 ## TODO
 
-The following service integrations are placeholders and need implementation:
+### Completed ✓
 
-- [ ] **Microsoft Graph API**: Implement OAuth flow and email fetching
-- [ ] **Claude AI Integration**: Implement email classification and analysis
-- [ ] **Urgency Scoring**: Complete multi-factor scoring algorithm
-- [ ] **Action Item Extraction**: Parse deadlines and tasks from emails
-- [ ] **Batch Processing**: Optimize bulk email classification
+- [x] **Microsoft Graph API**: OAuth flow and email fetching (Week 1)
+- [x] **Claude AI Integration**: Email classification and analysis (Week 2)
+- [x] **Urgency Scoring**: Multi-factor scoring with 8 signal extractors (Week 3)
+- [x] **Action Item Extraction**: Deadline and task parsing from emails (Week 3)
+- [x] **Batch Processing**: Bulk scoring and assignment (Week 3)
+- [x] **Microsoft To-Do Integration**: Bidirectional sync and task management (Week 3)
+
+### In Progress / Planned
+
+- [ ] **Frontend Integration**: Connect React UI to scoring and assignment APIs
 - [ ] **Caching**: Add Redis for API response caching
 - [ ] **Testing**: Add unit and integration tests
 - [ ] **Logging**: Implement structured logging
 - [ ] **Error Handling**: Add global exception handlers
 - [ ] **Rate Limiting**: Protect API endpoints
+- [ ] **Real-time Updates**: WebSocket support for live email updates
+- [ ] **Analytics Dashboard**: Visualize urgency trends and assignment metrics
 
 ## License
 

@@ -28,6 +28,10 @@ class Email(Base):
     confidence = Column(Float)  # 0.0 to 1.0
     urgency_score = Column(Float)  # 0.0 to 1.0
     due_date = Column(DateTime, nullable=True)
+    todo_task_id = Column(String, nullable=True)  # Microsoft To-Do task ID
+
+    # Urgency score relationship
+    urgency_score_record = relationship("UrgencyScore", back_populates="email", uselist=False)
 
     # Status fields
     folder = Column(String, default="inbox")  # inbox, archive, deleted
