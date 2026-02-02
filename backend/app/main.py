@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
 
 from .database import engine, SessionLocal, init_db
-from .models import Category, Email, User, UserSettings  # Import all models before init_db()
+from .models import Category, Email, User, UserSettings, ClassificationLog, OverrideLog  # Import all models before init_db()
 from .routes import auth_router, emails_router, settings_router
 
 
