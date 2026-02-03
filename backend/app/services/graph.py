@@ -196,7 +196,7 @@ class GraphClient:
         params = {
             "$top": min(count, 50),  # Graph API max is 50 per page
             "$orderby": "receivedDateTime desc",
-            "$select": "id,from,subject,bodyPreview,body,receivedDateTime,importance,conversationId,hasAttachments,isRead,toRecipients,ccRecipients"
+            "$select": "id,immutableId,from,subject,bodyPreview,body,receivedDateTime,importance,conversationId,hasAttachments,isRead,toRecipients,ccRecipients"
         }
 
         async with httpx.AsyncClient() as client:
@@ -253,6 +253,7 @@ class GraphClient:
 
         return {
             "message_id": email_data.get("id"),
+            "immutable_id": email_data.get("immutableId"),
             "from_address": from_field.get("address", ""),
             "from_name": from_field.get("name", ""),
             "subject": email_data.get("subject", ""),
@@ -304,6 +305,7 @@ class GraphClient:
             # Create new email record
             email = Email(
                 message_id=email_data["message_id"],
+                immutable_id=email_data.get("immutable_id"),
                 from_address=email_data["from_address"],
                 from_name=email_data["from_name"],
                 subject=email_data["subject"],

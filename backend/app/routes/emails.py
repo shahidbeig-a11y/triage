@@ -4,6 +4,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 import time
 import asyncio
+import httpx
 from ..database import get_db
 from ..models import Email, User, ClassificationLog, OverrideLog, Category, UrgencyScore
 from ..services.graph import GraphClient
@@ -12,10 +13,29 @@ from ..services.classifier_override import check_override
 from ..services.classifier_ai import classify_with_ai
 from ..services.pipeline import run_full_pipeline
 from ..services.scoring import score_email
+from ..services.undo_service import record_action
+from ..services.outlook_categories import replace_category_on_email, remove_all_app_categories
 from pydantic import BaseModel
 import json
 
 router = APIRouter(prefix="/api/emails", tags=["emails"])
+
+
+def get_work_category_ids(db: Session) -> list:
+    """Get list of Work category IDs from database."""
+    work_categories = db.query(Category).filter(Category.master_category == "Work").all()
+    return [cat.id for cat in work_categories]
+
+
+class ReclassifyRequest(BaseModel):
+    category_id: int
+
+
+class ApproveRequest(BaseModel):
+    due_date: Optional[str] = None
+    category_id: Optional[int] = None
+    folder: Optional[str] = None
+    assigned_to: Optional[str] = None
 
 
 @router.post("/fetch")
@@ -64,9 +84,9 @@ async def fetch_emails(
 
 @router.get("/")
 async def list_emails(
-    limit: int = Query(default=20, ge=1, le=100, description="Number of emails to return"),
+    limit: int = Query(default=1000, ge=1, le=10000, description="Number of emails to return"),
     offset: int = Query(default=0, ge=0, description="Number of emails to skip"),
-    folder: Optional[str] = Query(default=None, description="Filter by folder (inbox, archive, deleted)"),
+    folder: Optional[str] = Query(default="inbox", description="Filter by folder (inbox, archive, deleted). Defaults to inbox."),
     status: Optional[str] = Query(default=None, description="Filter by status (unprocessed, processed, archived)"),
     db: Session = Depends(get_db)
 ):
@@ -74,9 +94,9 @@ async def list_emails(
     Get stored emails from the database with pagination.
 
     Args:
-        limit: Maximum number of emails to return (1-100)
+        limit: Maximum number of emails to return (1-10000, default 1000)
         offset: Number of emails to skip for pagination
-        folder: Optional folder filter
+        folder: Folder filter (defaults to "inbox" to show only inbox emails)
         status: Optional status filter
         db: Database session
 
@@ -86,8 +106,14 @@ async def list_emails(
     # Build query
     query = db.query(Email)
 
-    if folder:
-        query = query.filter(Email.folder == folder)
+    # Filter by folder (default to inbox, or None/null for inbox emails)
+    if folder and folder.lower() != "all":
+        # Match emails where folder is explicitly set to the requested folder,
+        # OR folder is None/inbox (for inbox emails)
+        if folder.lower() == "inbox":
+            query = query.filter((Email.folder == None) | (Email.folder == "inbox") | (Email.folder == ""))
+        else:
+            query = query.filter(Email.folder == folder)
 
     if status:
         query = query.filter(Email.status == status)
@@ -124,6 +150,11 @@ async def list_emails(
             "category_id": email.category_id,
             "confidence": email.confidence,
             "urgency_score": email.urgency_score,
+            "due_date": email.due_date.isoformat() if email.due_date else None,
+            "todo_task_id": email.todo_task_id,
+            "assigned_to": email.assigned_to,
+            "recommended_folder": email.recommended_folder,
+            "folder_is_new": email.folder_is_new if hasattr(email, 'folder_is_new') else False,
         }
         email_list.append(email_dict)
 
@@ -515,8 +546,8 @@ async def classify_ai_batch(db: Session = Depends(get_db)):
                 "has_attachments": email.has_attachments,
             }
 
-            # Call AI classifier
-            result = classify_with_ai(email_dict)
+            # Call AI classifier with database session
+            result = classify_with_ai(email_dict, db_session=db)
 
             # Update email record
             email.category_id = result["category_id"]
@@ -731,11 +762,12 @@ async def check_scorable_emails(db: Session = Depends(get_db)):
     """
     Debug endpoint: Check how many emails are available for scoring.
 
-    Returns count of emails with status='classified' and category_id in [1, 2, 3, 4, 5].
+    Returns count of emails with status='classified' and in Work categories.
     """
+    work_ids = get_work_category_ids(db)
     count = db.query(Email).filter(
         Email.status == "classified",
-        Email.category_id.in_([1, 2, 3, 4, 5])
+        Email.category_id.in_(work_ids)
     ).count()
 
     return {
@@ -750,9 +782,10 @@ def debug_score_single(db: Session = Depends(get_db)):
     Debug endpoint: Score a single email to test if scoring works.
     """
     # Get one email
+    work_ids = get_work_category_ids(db)
     email = db.query(Email).filter(
         Email.status == "classified",
-        Email.category_id.in_([1, 2, 3, 4, 5])
+        Email.category_id.in_(work_ids)
     ).first()
 
     if not email:
@@ -798,9 +831,9 @@ def debug_score_single(db: Session = Depends(get_db)):
 @router.post("/score")
 def score_work_emails(db: Session = Depends(get_db)):
     """
-    Calculate urgency scores for all classified Work emails (categories 1-5).
+    Calculate urgency scores for all classified Work emails.
 
-    Fetches all emails with status='classified' and category_id 1-5 (Work items),
+    Fetches all emails with status='classified' in Work categories,
     runs the urgency scoring engine on each, updates the urgency_score field,
     and stores detailed breakdown in urgency_scores table.
 
@@ -814,10 +847,11 @@ def score_work_emails(db: Session = Depends(get_db)):
         dict: Statistics with total scored, score distribution, floor/stale details,
               average raw and adjusted scores
     """
-    # Fetch all classified Work emails (categories 1-5)
+    # Fetch all classified Work emails
+    work_ids = get_work_category_ids(db)
     work_emails = db.query(Email).filter(
         Email.status == "classified",
-        Email.category_id.in_([1, 2, 3, 4, 5])
+        Email.category_id.in_(work_ids)
     ).all()
 
     total_scored = len(work_emails)
@@ -995,7 +1029,7 @@ def get_scored_emails(db: Session = Depends(get_db)):
     """
     Get all scored Work emails sorted by urgency score (descending).
 
-    Returns the ranked priority list of all Work emails (categories 1-5) that have
+    Returns the ranked priority list of all Work emails that have
     been scored, ordered from highest to lowest urgency.
 
     Args:
@@ -1006,11 +1040,12 @@ def get_scored_emails(db: Session = Depends(get_db)):
               urgency_score, raw_score, stale_bonus, floor_override, force_today, stale_days
     """
     # Get all Work emails with urgency scores, joined with urgency_scores table
+    work_ids = get_work_category_ids(db)
     scored_emails = db.query(Email, UrgencyScore).join(
         UrgencyScore, Email.id == UrgencyScore.email_id
     ).filter(
         Email.status == "classified",
-        Email.category_id.in_([1, 2, 3, 4, 5])
+        Email.category_id.in_(work_ids)
     ).order_by(
         UrgencyScore.urgency_score.desc()
     ).all()
@@ -1057,11 +1092,12 @@ def assign_due_dates_to_emails(db: Session = Depends(get_db)):
     from datetime import datetime
 
     # Fetch all scored Work emails
+    work_ids = get_work_category_ids(db)
     scored_emails_db = db.query(Email, UrgencyScore).join(
         UrgencyScore, Email.id == UrgencyScore.email_id
     ).filter(
         Email.status == "classified",
-        Email.category_id.in_([1, 2, 3, 4, 5]),
+        Email.category_id.in_(work_ids),
         Email.urgency_score.isnot(None)
     ).order_by(
         UrgencyScore.urgency_score.desc()
@@ -1172,11 +1208,12 @@ def get_todays_emails(db: Session = Depends(get_db)):
     today = date.today()
 
     # Query emails with today's due date, joined with urgency_scores
+    work_ids = get_work_category_ids(db)
     todays_emails = db.query(Email, UrgencyScore).join(
         UrgencyScore, Email.id == UrgencyScore.email_id
     ).filter(
         Email.status == "classified",
-        Email.category_id.in_([1, 2, 3, 4, 5]),
+        Email.category_id.in_(work_ids),
         Email.due_date >= datetime.combine(today, datetime.min.time()),
         Email.due_date < datetime.combine(today + timedelta(days=1), datetime.min.time())
     ).order_by(
@@ -1232,11 +1269,12 @@ async def sync_to_microsoft_todo(db: Session = Depends(get_db)):
         access_token = await graph_client.get_token(user.email, db)
 
         # Fetch all Work emails with due dates that haven't been synced yet
+        work_ids = get_work_category_ids(db)
         emails_query = db.query(Email, UrgencyScore).join(
             UrgencyScore, Email.id == UrgencyScore.email_id
         ).filter(
             Email.status == "classified",
-            Email.category_id.in_([1, 2, 3, 4, 5]),
+            Email.category_id.in_(work_ids),
             Email.due_date.isnot(None),
             Email.todo_task_id.is_(None)
         ).order_by(
@@ -1422,3 +1460,1621 @@ async def cleanup_todo_tasks(db: Session = Depends(get_db)):
         if "Token expired" in error_message or "re-authenticate" in error_message:
             raise HTTPException(status_code=401, detail=error_message)
         raise HTTPException(status_code=500, detail=f"Failed to clean up tasks: {error_message}")
+
+
+@router.put("/{email_id}/reclassify")
+async def reclassify_email(
+    email_id: int,
+    request: ReclassifyRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Reclassify an email to a different category (manual override).
+
+    This endpoint allows users to manually change an email's category from the UI.
+    - If moving to Work categories (1-5): sets status='classified' and triggers urgency scoring
+    - If moving to Other categories (6-11): clears urgency_score and due_date
+    - Logs the change in classification_log with classifier_type='manual'
+
+    Args:
+        email_id: ID of the email to reclassify
+        request: Request body containing the new category_id
+        db: Database session
+
+    Returns:
+        dict: Updated email data
+    """
+    print(f"[RECLASSIFY] Received request for email_id={email_id}, category_id={request.category_id}")
+
+    try:
+        # Get the email
+        email = db.query(Email).filter(Email.id == email_id).first()
+        print(f"[RECLASSIFY] Found email: {email is not None}")
+        if not email:
+            raise HTTPException(status_code=404, detail="Email not found")
+
+        # Get the category by number (1-11) to verify it exists
+        category = db.query(Category).filter(Category.number == request.category_id).first()
+        if not category:
+            raise HTTPException(status_code=400, detail=f"Invalid category_id: {request.category_id}")
+
+        # Extract category details for later use
+        category_number = category.number
+        category_label = category.label
+
+        # Store old category for logging
+        old_category_id = email.category_id
+
+        # Update the email's category (use the database ID, not the number)
+        email.category_id = category.id
+
+        # Handle category-specific logic based on master_category
+        if category.master_category == "Work":
+            # Work categories - set as classified and trigger AI due date assignment
+            email.status = "classified"
+
+            # Use AI to assign due date based on calendar, context, sender, and urgency
+            try:
+                from ..services.ai_due_date_assigner import assign_due_date_with_ai, assign_due_date_simple
+
+                # Convert email object to dictionary
+                email_dict = {
+                    "id": email.id,
+                    "message_id": email.message_id,
+                    "from_address": email.from_address,
+                    "from_name": email.from_name,
+                    "subject": email.subject,
+                    "body_preview": email.body_preview,
+                    "body": email.body,
+                    "received_at": email.received_at,
+                    "importance": email.importance,
+                    "conversation_id": email.conversation_id,
+                    "has_attachments": email.has_attachments,
+                }
+
+                # Convert category to dict
+                category_dict = {
+                    "id": category.id,
+                    "number": category.number,
+                    "label": category.label,
+                    "master_category": category.master_category
+                }
+
+                # Get access token for calendar API
+                user = db.query(User).first()
+                if user:
+                    graph_client = GraphClient()
+                    access_token = await graph_client.get_token(user.email, db)
+
+                    # Use AI to determine due date
+                    print(f"[RECLASSIFY] Calling AI to assign due date...")
+                    due_date, reasoning = await assign_due_date_with_ai(
+                        email_dict,
+                        category_dict,
+                        access_token,
+                        db
+                    )
+
+                    email.due_date = due_date
+                    print(f"[RECLASSIFY] AI assigned due date: {due_date} - {reasoning}")
+                else:
+                    # Fallback if no user/token
+                    print(f"[RECLASSIFY] No user found, using simple assignment")
+                    due_date = assign_due_date_simple(email_dict, category_dict)
+                    email.due_date = due_date
+                    print(f"[RECLASSIFY] Simple assignment: {due_date}")
+
+            except Exception as e:
+                # Log error but don't fail the request
+                print(f"Warning: Failed to assign due date during reclassification: {str(e)}")
+                import traceback
+                traceback.print_exc()
+
+                # Fallback to simple assignment
+                from ..services.ai_due_date_assigner import assign_due_date_simple
+                email_dict = {
+                    "subject": email.subject,
+                    "body_preview": email.body_preview,
+                    "importance": email.importance,
+                    "has_attachments": email.has_attachments,
+                }
+                category_dict = {
+                    "label": category.label,
+                    "master_category": category.master_category
+                }
+                email.due_date = assign_due_date_simple(email_dict, category_dict)
+                print(f"[RECLASSIFY] Fallback assignment: {email.due_date}")
+
+            # If moving from Other to Work, flag the email and apply new category
+            old_category = db.query(Category).filter(Category.id == old_category_id).first()
+            print(f"[RECLASSIFY] Moving to Work. Old category: {old_category.label if old_category else 'None'}, master: {old_category.master_category if old_category else 'None'}")
+            if old_category and old_category.master_category == "Other":
+                print(f"[RECLASSIFY] Detected Other → Work transition")
+                try:
+                    # Get access token
+                    user = db.query(User).first()
+                    if user:
+                        print(f"[RECLASSIFY] Got user, getting access token")
+                        graph_client = GraphClient()
+                        access_token = await graph_client.get_token(user.email, db)
+
+                        async with httpx.AsyncClient() as client:
+                            # Flag the email in Outlook with due date
+                            print(f"[RECLASSIFY] Flagging email {email_id} with due date {email.due_date}")
+
+                            # Prepare flag data with due date if available
+                            flag_data = {"flagStatus": "flagged"}
+                            if email.due_date:
+                                # Format due date for Graph API (ISO 8601 format)
+                                from datetime import datetime
+                                due_date_str = email.due_date.isoformat()
+                                if 'T' not in due_date_str:
+                                    due_date_str = f"{due_date_str}T09:00:00"  # Set to 9 AM UTC
+
+                                # Set startDateTime to now
+                                start_date_str = datetime.utcnow().isoformat(timespec='seconds')
+
+                                flag_data["startDateTime"] = {
+                                    "dateTime": start_date_str,
+                                    "timeZone": "UTC"
+                                }
+                                flag_data["dueDateTime"] = {
+                                    "dateTime": due_date_str,
+                                    "timeZone": "UTC"
+                                }
+                                print(f"[RECLASSIFY] Setting flag dates - start: {start_date_str}, due: {due_date_str}")
+
+                            flag_response = await client.patch(
+                                f"https://graph.microsoft.com/v1.0/me/messages/{email.message_id}",
+                                headers={
+                                    "Authorization": f"Bearer {access_token}",
+                                    "Content-Type": "application/json"
+                                },
+                                json={"flag": flag_data}
+                            )
+                            if flag_response.status_code in [200, 204]:
+                                print(f"[RECLASSIFY] ✓ Flagged email {email_id} with due date")
+                            else:
+                                print(f"[RECLASSIFY] ✗ Failed to flag email {email_id}: {flag_response.status_code}")
+                                print(f"[RECLASSIFY] Response: {flag_response.text}")
+
+                        # Apply new Work category label in Outlook
+                        print(f"[RECLASSIFY] Applying category: number={category_number}, label={category_label}")
+                        if category_number and category_label:
+                            outlook_category_name = f"{category_number}. {category_label}"
+                            print(f"[RECLASSIFY] Calling replace_category_on_email with '{outlook_category_name}'")
+                            result = await replace_category_on_email(
+                                access_token,
+                                email.message_id,
+                                outlook_category_name
+                            )
+                            print(f"[RECLASSIFY] ✓ replace_category_on_email returned: {result}")
+                        else:
+                            print(f"[RECLASSIFY] ✗ Category number or label is None!")
+
+
+                except Exception as e:
+                    print(f"[RECLASSIFY] ✗ Exception: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+            elif old_category and old_category.master_category == "Work":
+                # Moving Work → Work, update Outlook category and due date
+                try:
+                    user = db.query(User).first()
+                    if user and category_number and category_label:
+                        graph_client = GraphClient()
+                        access_token = await graph_client.get_token(user.email, db)
+
+                        outlook_category_name = f"{category_number}. {category_label}"
+                        await replace_category_on_email(
+                            access_token,
+                            email.message_id,
+                            outlook_category_name
+                        )
+                        print(f"Updated Outlook category to '{outlook_category_name}' for email {email_id}")
+
+                        # Update flag's due date (which updates the To-Do task automatically)
+                        if email.due_date:
+                            print(f"[RECLASSIFY] Updating flag due date for Work → Work transition to {email.due_date}")
+
+                            # Format due date for Graph API (ISO 8601 format)
+                            from datetime import datetime
+                            due_date_str = email.due_date.isoformat()
+                            if 'T' not in due_date_str:
+                                due_date_str = f"{due_date_str}T09:00:00"  # Set to 9 AM UTC
+
+                            # Set startDateTime to now
+                            start_date_str = datetime.utcnow().isoformat(timespec='seconds')
+
+                            async with httpx.AsyncClient() as client:
+                                flag_update_response = await client.patch(
+                                    f"https://graph.microsoft.com/v1.0/me/messages/{email.message_id}",
+                                    headers={
+                                        "Authorization": f"Bearer {access_token}",
+                                        "Content-Type": "application/json"
+                                    },
+                                    json={
+                                        "flag": {
+                                            "flagStatus": "flagged",
+                                            "startDateTime": {
+                                                "dateTime": start_date_str,
+                                                "timeZone": "UTC"
+                                            },
+                                            "dueDateTime": {
+                                                "dateTime": due_date_str,
+                                                "timeZone": "UTC"
+                                            }
+                                        }
+                                    }
+                                )
+                                if flag_update_response.status_code in [200, 204]:
+                                    print(f"[RECLASSIFY] ✓ Updated flag due date successfully")
+                                else:
+                                    print(f"[RECLASSIFY] ✗ Failed to update flag due date: {flag_update_response.status_code}")
+
+                except Exception as e:
+                    print(f"Warning: Failed to update Outlook category for email {email_id}: {str(e)}")
+
+        elif category.master_category == "Other":
+            # Other/noise categories - clear urgency data
+            email.urgency_score = None
+            email.due_date = None
+
+            # Also clear urgency_score_record if it exists
+            if email.urgency_score_record:
+                db.delete(email.urgency_score_record)
+
+            # If moving from Work to Other, unflag email, delete To-Do task, and apply Other category
+            old_category = db.query(Category).filter(Category.id == old_category_id).first()
+            print(f"[RECLASSIFY] Moving to Other. Old category: {old_category.label if old_category else 'None'}, master: {old_category.master_category if old_category else 'None'}")
+            if old_category and old_category.master_category == "Work":
+                print(f"[RECLASSIFY] Detected Work → Other transition")
+                try:
+                    # Get access token
+                    user = db.query(User).first()
+                    if user:
+                        graph_client = GraphClient()
+                        access_token = await graph_client.get_token(user.email, db)
+
+                        async with httpx.AsyncClient() as client:
+                            # Unflag the email in Outlook
+                            unflag_response = await client.patch(
+                                f"https://graph.microsoft.com/v1.0/me/messages/{email.message_id}",
+                                headers={
+                                    "Authorization": f"Bearer {access_token}",
+                                    "Content-Type": "application/json"
+                                },
+                                json={"flag": {"flagStatus": "notFlagged"}}
+                            )
+                            if unflag_response.status_code not in [200, 204]:
+                                print(f"Warning: Failed to unflag email {email_id}: {unflag_response.status_code}")
+
+                        # Apply new Other category label
+                        print(f"[RECLASSIFY] Applying Other category: number={category_number}, label={category_label}")
+                        if category_number and category_label:
+                            outlook_category_name = f"{category_number}. {category_label}"
+                            print(f"[RECLASSIFY] Calling replace_category_on_email with '{outlook_category_name}'")
+                            result = await replace_category_on_email(
+                                access_token,
+                                email.message_id,
+                                outlook_category_name
+                            )
+                            print(f"[RECLASSIFY] ✓ replace_category_on_email returned: {result}")
+                        else:
+                            print(f"[RECLASSIFY] ✗ Category number or label is None!")
+
+                        # Delete To-Do task if it exists
+                        if email.todo_task_id:
+                            # Get the task list
+                            lists_response = await client.get(
+                                f"https://graph.microsoft.com/v1.0/me/todo/lists",
+                                headers={"Authorization": f"Bearer {access_token}"}
+                            )
+
+                            if lists_response.status_code == 200:
+                                task_list_id = None
+                                for task_list in lists_response.json().get('value', []):
+                                    if task_list.get('displayName') in ['Flagged Emails', 'Tasks']:
+                                        task_list_id = task_list['id']
+                                        break
+
+                                if task_list_id:
+                                    # Delete the task
+                                    delete_response = await client.delete(
+                                        f"https://graph.microsoft.com/v1.0/me/todo/lists/{task_list_id}/tasks/{email.todo_task_id}",
+                                        headers={"Authorization": f"Bearer {access_token}"}
+                                    )
+                                    if delete_response.status_code in [200, 204]:
+                                        email.todo_task_id = None
+                                        print(f"Deleted To-Do task for email {email_id}")
+                                    else:
+                                        print(f"Warning: Failed to delete To-Do task: {delete_response.status_code}")
+
+                except Exception as e:
+                    print(f"Warning: Failed to unflag/remove To-Do for email {email_id}: {str(e)}")
+            else:
+                # Moving Other → Other, just update the category label
+                try:
+                    user = db.query(User).first()
+                    if user and category_number and category_label:
+                        graph_client = GraphClient()
+                        access_token = await graph_client.get_token(user.email, db)
+
+                        outlook_category_name = f"{category_number}. {category_label}"
+                        await replace_category_on_email(
+                            access_token,
+                            email.message_id,
+                            outlook_category_name
+                        )
+                        print(f"Updated Outlook category to '{outlook_category_name}' for email {email_id}")
+
+                except Exception as e:
+                    print(f"Warning: Failed to update Outlook category for email {email_id}: {str(e)}")
+
+        # Log the manual reclassification
+        log_entry = ClassificationLog(
+            email_id=email.id,
+            classifier_type="manual",
+            category_id=category.id,  # Use database ID
+            confidence=1.0,  # Manual classification is 100% confident
+            rule="manual_reclassification"
+        )
+        db.add(log_entry)
+
+        # Commit changes
+        db.commit()
+        db.refresh(email)
+
+        # Prepare response data (match format from list_emails endpoint)
+        response_data = {
+            "id": email.id,
+            "message_id": email.message_id,
+            "from_address": email.from_address,
+            "from_name": email.from_name,
+            "subject": email.subject,
+            "body_preview": email.body_preview,
+            "body": email.body,
+            "received_at": email.received_at.isoformat() if email.received_at else None,
+            "importance": email.importance,
+            "conversation_id": email.conversation_id,
+            "has_attachments": email.has_attachments,
+            "is_read": email.is_read,
+            "to_recipients": json.loads(email.to_recipients) if email.to_recipients else [],
+            "cc_recipients": json.loads(email.cc_recipients) if email.cc_recipients else [],
+            "folder": email.folder,
+            "status": email.status,
+            "category_id": email.category_id,
+            "confidence": email.confidence,
+            "urgency_score": email.urgency_score,
+            "due_date": email.due_date.isoformat() if email.due_date else None,
+            "todo_task_id": email.todo_task_id,
+            "assigned_to": email.assigned_to,
+            "recommended_folder": email.recommended_folder,
+            "folder_is_new": email.folder_is_new if hasattr(email, 'folder_is_new') else False,
+        }
+
+        # Calculate stale_days if there's an urgency score record
+        if email.urgency_score_record:
+            response_data["floor_override"] = email.urgency_score_record.floor_override or False
+            response_data["stale_days"] = email.urgency_score_record.stale_days or 0
+
+        print(f"[RECLASSIFY] Success! Returning response")
+        return response_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[RECLASSIFY] ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Reclassification failed: {str(e)}")
+
+
+# ============================================================================
+# APPROVAL AND EXECUTION ENDPOINTS
+# ============================================================================
+
+
+@router.put("/{email_id}/approve")
+async def approve_email(
+    email_id: int,
+    request: ApproveRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Mark an email as approved.
+
+    Accepts optional body with:
+    - due_date: YYYY-MM-DD format
+    - category_id: Category ID to override
+    - folder: Target folder ID for execution
+
+    Updates the email in SQLite with confirmed values and sets status = 'approved'.
+
+    Args:
+        email_id: ID of the email to approve
+        request: Optional approval metadata
+        db: Database session
+
+    Returns:
+        dict: Updated email data
+    """
+    # Get the email
+    email = db.query(Email).filter(Email.id == email_id).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    # Get user for action tracking
+    user = db.query(User).first()
+
+    # Store previous values for undo
+    previous_status = email.status
+    previous_category_id = email.category_id
+    previous_due_date = email.due_date
+    previous_folder = email.folder
+    previous_assigned_to = email.assigned_to
+
+    # Update email status
+    email.status = "approved"
+
+    # Track timing for calibration
+    email.approved_at = datetime.utcnow()
+
+    # Update optional fields if provided
+    if request.due_date:
+        try:
+            # Parse date string to datetime
+            email.due_date = datetime.strptime(request.due_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    if request.category_id is not None:
+        # Verify category exists
+        category = db.query(Category).filter(Category.id == request.category_id).first()
+        if not category:
+            raise HTTPException(status_code=400, detail="Invalid category_id")
+        email.category_id = request.category_id
+
+    if request.folder:
+        email.folder = request.folder
+
+    if request.assigned_to is not None:
+        email.assigned_to = request.assigned_to
+
+    # Record action for undo
+    action_data = {
+        "email_ids": [{
+            "email_id": email.id,
+            "previous_status": previous_status,
+            "previous_category_id": previous_category_id,
+            "previous_due_date": previous_due_date.isoformat() if previous_due_date else None,
+            "previous_folder": previous_folder,
+            "previous_assigned_to": previous_assigned_to,
+        }]
+    }
+    if user:
+        record_action(
+            db,
+            action_type="approve",
+            description=f"Approved email: {email.subject[:50]}",
+            action_data=action_data,
+            user_id=user.id
+        )
+
+    db.commit()
+    db.refresh(email)
+
+    return {
+        "id": email.id,
+        "message_id": email.message_id,
+        "subject": email.subject,
+        "from_name": email.from_name,
+        "from_address": email.from_address,
+        "status": email.status,
+        "category_id": email.category_id,
+        "due_date": email.due_date.isoformat() if email.due_date else None,
+        "folder": email.folder,
+        "urgency_score": email.urgency_score,
+        "recommended_folder": email.recommended_folder,
+        "folder_is_new": email.folder_is_new if hasattr(email, 'folder_is_new') else False,
+        "message": "Email approved successfully"
+    }
+
+
+@router.put("/{email_id}/unapprove")
+async def unapprove_email(
+    email_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Revert an approved email back to 'classified' status.
+
+    Args:
+        email_id: ID of the email to unapprove
+        db: Database session
+
+    Returns:
+        dict: Updated email data
+    """
+    # Get the email
+    email = db.query(Email).filter(Email.id == email_id).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    # Revert status to classified
+    email.status = "classified"
+
+    db.commit()
+    db.refresh(email)
+
+    return {
+        "id": email.id,
+        "message_id": email.message_id,
+        "subject": email.subject,
+        "status": email.status,
+        "message": "Email unapproved successfully"
+    }
+
+
+# Folder cache with 1 hour expiry
+_folder_cache = {"data": None, "expires_at": None}
+
+
+@router.get("/folders")
+async def get_folders(db: Session = Depends(get_db)):
+    """
+    Get the user's Outlook folder list from Graph API.
+
+    Caches results for 1 hour to reduce API calls.
+
+    Args:
+        db: Database session
+
+    Returns:
+        dict: List of folders with id and displayName
+    """
+    from datetime import datetime
+
+    # Check cache
+    if _folder_cache["data"] and _folder_cache["expires_at"]:
+        if datetime.utcnow() < _folder_cache["expires_at"]:
+            return {"folders": _folder_cache["data"], "cached": True}
+
+    # Get the authenticated user
+    user = db.query(User).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please log in first.")
+
+    try:
+        # Get valid access token
+        graph_client = GraphClient()
+        access_token = await graph_client.get_token(user.email, db)
+
+        # Fetch folders from Graph API
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://graph.microsoft.com/v1.0/me/mailFolders",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Token expired. Please re-authenticate.")
+
+            response.raise_for_status()
+            data = response.json()
+
+            folders = [
+                {"id": folder["id"], "displayName": folder["displayName"]}
+                for folder in data.get("value", [])
+            ]
+
+            # Cache for 1 hour
+            _folder_cache["data"] = folders
+            _folder_cache["expires_at"] = datetime.utcnow() + timedelta(hours=1)
+
+            return {"folders": folders, "cached": False}
+
+    except Exception as e:
+        error_message = str(e)
+        if "Token expired" in error_message or "re-authenticate" in error_message:
+            raise HTTPException(status_code=401, detail=error_message)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch folders: {error_message}")
+
+
+@router.post("/execute")
+async def execute_approved_emails(db: Session = Depends(get_db)):
+    """
+    Batch execution endpoint for approved emails.
+
+    For all emails with status = 'approved':
+    a) Apply Outlook category to each email
+    b) Move each email to its target folder via Graph API
+    c) Create/update Microsoft To-Do tasks for items with due dates
+    d) Set email status to 'actioned' in SQLite
+
+    Args:
+        db: Database session
+
+    Returns:
+        dict: Execution summary with counts and errors
+    """
+    from app.services.todo_sync_batch import sync_all_tasks_batch as sync_all_tasks, TodoSyncError, TokenExpiredError
+    from app.services.outlook_categories import ensure_category_exists_and_apply, replace_category_on_email, remove_all_app_categories
+    from app.services.undo_service import record_action
+
+    # Get the authenticated user
+    user = db.query(User).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please log in first.")
+
+    try:
+        # Get valid access token
+        graph_client = GraphClient()
+        access_token = await graph_client.get_token(user.email, db)
+
+        # Get all approved emails
+        approved_emails = db.query(Email).filter(Email.status == "approved").all()
+
+        if not approved_emails:
+            return {
+                "executed": 0,
+                "folders_moved": 0,
+                "todos_created": 0,
+                "errors": [],
+                "message": "No approved emails to execute"
+            }
+
+        executed_count = 0
+        folders_moved = 0
+        todos_created = 0
+        errors = []
+
+        # Track action data for undo
+        action_data = []
+
+        # Get category mapping for auto-assigning folders
+        categories = db.query(Category).all()
+        category_map = {cat.id: cat.label for cat in categories}
+
+        # Get folder mapping (fetch once for all operations)
+        # Include both top-level folders and child folders (especially under Inbox)
+        folder_map = {}
+        inbox_folder_id = None
+        try:
+            async with httpx.AsyncClient() as client:
+                # Get top-level folders
+                response = await client.get(
+                    f"https://graph.microsoft.com/v1.0/me/mailFolders",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                for folder in data.get("value", []):
+                    folder_name = folder["displayName"]
+                    folder_id = folder["id"]
+                    folder_map[folder_name.lower()] = folder_id
+
+                    # Save Inbox folder ID for creating subfolders
+                    if folder_name == "Inbox":
+                        inbox_folder_id = folder_id
+
+                    # Also fetch child folders of Inbox
+                    if folder_name == "Inbox":
+                        try:
+                            child_response = await client.get(
+                                f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/childFolders",
+                                headers={"Authorization": f"Bearer {access_token}"}
+                            )
+                            if child_response.status_code == 200:
+                                for child in child_response.json().get("value", []):
+                                    folder_map[child["displayName"].lower()] = child["id"]
+                        except Exception as child_error:
+                            errors.append(f"Failed to fetch Inbox child folders: {str(child_error)}")
+        except Exception as e:
+            errors.append(f"Failed to fetch folder list: {str(e)}")
+
+        # Process each approved email
+        for email in approved_emails:
+            try:
+                # Track if this email was successfully processed
+                email_processed_successfully = True
+
+                # Get category info
+                category = db.query(Category).filter(Category.id == email.category_id).first()
+                category_label = category.label if category else None
+                category_number = category.number if category else None
+                category_master = category.master_category if category else None
+
+                # Category handling:
+                # - Work emails: Apply category label (for action tracking)
+                # - Other emails: Remove all categories (they're just being filed)
+                if category_master == "Work" and category_number and category_label:
+                    # Apply category for Work emails
+                    outlook_category_name = f"{category_number}. {category_label}"
+                    try:
+                        # First ensure category exists in master list
+                        from app.services.outlook_categories import get_outlook_categories, create_outlook_category
+                        existing_categories = await get_outlook_categories(access_token)
+                        if outlook_category_name not in existing_categories:
+                            await create_outlook_category(access_token, outlook_category_name)
+
+                        # Replace category on email (removes old app categories)
+                        await replace_category_on_email(
+                            access_token,
+                            email.message_id,
+                            outlook_category_name
+                        )
+                    except Exception as e:
+                        errors.append(f"Failed to apply category to email {email.id}: {str(e)}")
+                elif category_master == "Other":
+                    # Remove all app categories for Other emails (they're being filed)
+                    try:
+                        await remove_all_app_categories(access_token, email.message_id)
+                    except Exception as e:
+                        errors.append(f"Failed to remove categories from email {email.id}: {str(e)}")
+
+                # Update To-Do task title if category changed and task exists
+                if email.todo_task_id and category_number and category_label:
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            # Get the task list ID
+                            lists_response = await client.get(
+                                f"https://graph.microsoft.com/v1.0/me/todo/lists",
+                                headers={"Authorization": f"Bearer {access_token}"}
+                            )
+
+                            if lists_response.status_code == 200:
+                                task_list_id = None
+                                for task_list in lists_response.json().get('value', []):
+                                    if task_list.get('displayName') in ['Flagged Emails', 'Tasks']:
+                                        task_list_id = task_list['id']
+                                        break
+
+                                if task_list_id:
+                                    # Build new task title
+                                    from app.services.todo_sync_batch import get_category_prefix
+                                    category_prefix = get_category_prefix(category_number, category_label)
+
+                                    # For Discuss (4) and Delegate (5), prepend person name if available
+                                    if email.assigned_to and category_number in [4, 5]:
+                                        new_title = f"{category_prefix} {email.assigned_to}: {email.subject}"
+                                    else:
+                                        new_title = f"{category_prefix} {email.subject}"
+
+                                    if len(new_title) > 255:
+                                        new_title = new_title[:252] + "..."
+
+                                    # Update the task
+                                    update_response = await client.patch(
+                                        f"https://graph.microsoft.com/v1.0/me/todo/lists/{task_list_id}/tasks/{email.todo_task_id}",
+                                        headers={
+                                            "Authorization": f"Bearer {access_token}",
+                                            "Content-Type": "application/json"
+                                        },
+                                        json={"title": new_title}
+                                    )
+
+                                    if update_response.status_code not in [200, 204]:
+                                        errors.append(f"Failed to update To-Do task for email {email.id}")
+                    except Exception as e:
+                        errors.append(f"Failed to update To-Do task for email {email.id}: {str(e)}")
+
+                # Folder handling:
+                # - Work emails: Stay in Inbox (no folder movement)
+                # - Other emails: Move to category folder
+                # - FYI - Group (7): Use AI-recommended folder
+                if category_master == "Other":
+                    # Special handling for FYI - Group (category 7)
+                    if category_number == 7 and email.recommended_folder:
+                        # Use AI-recommended folder
+                        email.folder = email.recommended_folder
+                    # Auto-assign folder based on category if not set
+                    elif not email.folder or email.folder == "inbox":
+                        if category_label:
+                            # Categories 8, 9, 10, 12 get numerical prefix in folder name
+                            if category_number in [8, 9, 10, 12]:
+                                email.folder = f"{category_number}. {category_label}"
+                            else:
+                                email.folder = category_label
+
+                    # Move to folder if specified
+                    if email.folder and email.folder != "inbox" and email.folder.lower() in folder_map:
+                        folder_id = folder_map[email.folder.lower()]
+                        try:
+                            async with httpx.AsyncClient() as client:
+                                move_response = await client.post(
+                                    f"https://graph.microsoft.com/v1.0/me/messages/{email.message_id}/move",
+                                    headers={
+                                        "Authorization": f"Bearer {access_token}",
+                                        "Content-Type": "application/json"
+                                    },
+                                    json={"destinationId": folder_id}
+                                )
+
+                                if move_response.status_code == 404:
+                                    errors.append(f"Email {email.id} not found in Outlook (may have been deleted)")
+                                    email_processed_successfully = False
+                                elif move_response.status_code in [200, 201]:
+                                    folders_moved += 1
+                                else:
+                                    errors.append(f"Failed to move email {email.id}: {move_response.status_code}")
+                                    email_processed_successfully = False
+                        except Exception as e:
+                            errors.append(f"Failed to move email {email.id} to folder: {str(e)}")
+                            email_processed_successfully = False
+                    elif email.folder and email.folder != "inbox" and email.folder.lower() not in folder_map:
+                        # Try to create the folder as a child of Inbox
+                        try:
+                            async with httpx.AsyncClient() as client:
+                                # Create folder under Inbox
+                                if inbox_folder_id:
+                                    create_response = await client.post(
+                                        f"https://graph.microsoft.com/v1.0/me/mailFolders/{inbox_folder_id}/childFolders",
+                                        headers={
+                                            "Authorization": f"Bearer {access_token}",
+                                            "Content-Type": "application/json"
+                                        },
+                                        json={"displayName": email.folder}
+                                    )
+                                else:
+                                    # Fallback to root-level folder if Inbox ID not found
+                                    create_response = await client.post(
+                                        f"https://graph.microsoft.com/v1.0/me/mailFolders",
+                                        headers={
+                                            "Authorization": f"Bearer {access_token}",
+                                            "Content-Type": "application/json"
+                                        },
+                                        json={"displayName": email.folder}
+                                    )
+
+                                if create_response.status_code in [200, 201]:
+                                    new_folder = create_response.json()
+                                    folder_id = new_folder["id"]
+                                    folder_map[email.folder.lower()] = folder_id
+
+                                    # Now move the email
+                                    move_response = await client.post(
+                                        f"https://graph.microsoft.com/v1.0/me/messages/{email.message_id}/move",
+                                        headers={
+                                            "Authorization": f"Bearer {access_token}",
+                                            "Content-Type": "application/json"
+                                        },
+                                        json={"destinationId": folder_id}
+                                    )
+                                    if move_response.status_code in [200, 201]:
+                                        folders_moved += 1
+                                    else:
+                                        errors.append(f"Failed to move email {email.id} after creating folder: {move_response.status_code}")
+                                        email_processed_successfully = False
+                                else:
+                                    errors.append(f"Failed to create folder '{email.folder}': {create_response.status_code}")
+                                    email_processed_successfully = False
+                        except Exception as e:
+                            errors.append(f"Failed to create folder '{email.folder}' and move email {email.id}: {str(e)}")
+                            email_processed_successfully = False
+
+                # Only mark as actioned if successfully processed
+                if email_processed_successfully:
+                    # Track action data for undo
+                    email_action_data = {
+                        "email_id": email.id,
+                        "category_applied": bool(category_number and category_label),
+                        "category_name": f"{category_number}. {category_label}" if category_number and category_label else None,
+                        "email_flagged": False,  # Will be set by todo sync
+                        "todo_created": False,  # Will be set by todo sync
+                        "todo_list_id": None,  # Will be set by todo sync
+                        "folder_moved": category_master == "Other" and email.folder and email.folder != "inbox",
+                        "original_folder": "inbox",
+                    }
+                    action_data.append(email_action_data)
+
+                    # Mark as actioned
+                    email.status = "actioned"
+
+                    # Track execution time for calibration
+                    email.executed_at = datetime.utcnow()
+
+                    executed_count += 1
+                else:
+                    # Keep as approved if processing failed
+                    errors.append(f"Email {email.id} kept as 'approved' due to processing errors")
+
+            except Exception as e:
+                errors.append(f"Error processing email {email.id}: {str(e)}")
+                continue
+
+        # Record action for undo (before commit)
+        if executed_count > 0:
+            description = f"Executed {executed_count} email{'s' if executed_count > 1 else ''}"
+            record_action(
+                db,
+                action_type="execute",
+                description=description,
+                action_data={"email_ids": action_data},
+                user_id=user.id
+            )
+
+        # Commit all status updates
+        db.commit()
+
+        # Record actual durations for calibration
+        from app.services.duration_estimator import record_actual_duration
+        for email in approved_emails:
+            if email.status == "actioned":
+                try:
+                    record_actual_duration(db, email, user.id if user else None)
+                except Exception as e:
+                    logger.warning(f"Failed to record duration for email {email.id}: {e}")
+
+        # Sync to Microsoft To-Do for emails with due dates
+        # Get Work category IDs dynamically
+        work_category_ids = [cat.id for cat in categories if cat.master_category == "Work"]
+
+        # Get emails that need todo sync (have due dates but no todo_task_id yet)
+        emails_for_todo = db.query(Email, UrgencyScore).join(
+            UrgencyScore, Email.id == UrgencyScore.email_id
+        ).filter(
+            Email.status == "actioned",
+            Email.category_id.in_(work_category_ids),
+            Email.due_date.isnot(None),
+            Email.todo_task_id.is_(None)
+        ).all()
+
+        if emails_for_todo:
+            try:
+                # Convert to format expected by sync function
+                assigned_emails = []
+                for email, urgency in emails_for_todo:
+                    assigned_emails.append({
+                        "email_id": email.id,
+                        "message_id": email.message_id,
+                        "subject": email.subject,
+                        "body_preview": email.body_preview,
+                        "from_name": email.from_name,
+                        "from_address": email.from_address,
+                        "received_at": email.received_at,
+                        "due_date": email.due_date,
+                        "category_id": email.category_id,
+                        "urgency_score": urgency.urgency_score,
+                        "floor_override": urgency.floor_override,
+                        "todo_task_id": email.todo_task_id
+                    })
+
+                # Sync to To-Do (pass db session for category loading)
+                sync_result = sync_all_tasks(access_token, assigned_emails, db)
+                todos_created = sync_result['synced']
+
+                # Commit todo_task_id updates
+                db.commit()
+
+                # Add sync errors if any
+                if sync_result.get('errors'):
+                    errors.extend(sync_result['errors'])
+
+            except Exception as e:
+                errors.append(f"Failed to sync to Microsoft To-Do: {str(e)}")
+
+        return {
+            "executed": executed_count,
+            "folders_moved": folders_moved,
+            "todos_created": todos_created,
+            "errors": errors,
+            "message": f"Executed {executed_count} emails. Moved {folders_moved} to folders. Created {todos_created} To-Do tasks."
+        }
+
+    except TokenExpiredError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        error_message = str(e)
+        if "Token expired" in error_message or "re-authenticate" in error_message:
+            raise HTTPException(status_code=401, detail=error_message)
+        raise HTTPException(status_code=500, detail=f"Execution failed: {error_message}")
+
+
+@router.post("/confirm-other")
+async def confirm_other_emails(db: Session = Depends(get_db)):
+    """
+    Bulk confirm for Other tab emails.
+
+    For all emails with status = 'classified' and category_id 6-11:
+    - Move each to its designated folder
+    - Set status = 'actioned'
+
+    Default folder mapping:
+    - Marketing (6) → Marketing folder
+    - Notification (7) → Notifications folder
+    - Calendar (8) → Calendar folder
+    - FYI (9) → FYI folder
+    - Travel (11) → Travel folder
+    - Other (10) → Other folder
+
+    Args:
+        db: Database session
+
+    Returns:
+        dict: Summary with confirmed count and moved count
+    """
+    # Get the authenticated user
+    user = db.query(User).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please log in first.")
+
+    try:
+        # Get valid access token
+        graph_client = GraphClient()
+        access_token = await graph_client.get_token(user.email, db)
+
+        # Get all categories to map IDs to folder names
+        categories = db.query(Category).filter(Category.master_category == "Other").all()
+        category_folder_map = {}
+        for cat in categories:
+            # Categories 8, 9, 10, 12 get numerical prefix in folder name
+            if cat.number in [8, 9, 10, 12]:
+                category_folder_map[cat.id] = f"{cat.number}. {cat.label}"
+            else:
+                category_folder_map[cat.id] = cat.label
+
+        # Get all classified Other emails
+        other_category_ids = [cat.id for cat in categories]
+        other_emails = db.query(Email).filter(
+            Email.status == "classified",
+            Email.category_id.in_(other_category_ids)
+        ).all()
+
+        if not other_emails:
+            return {
+                "confirmed": 0,
+                "moved": 0,
+                "message": "No Other emails to confirm"
+            }
+
+        confirmed_count = 0
+        moved_count = 0
+        errors = []
+
+        # Get folder mapping
+        folder_map = {}
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"https://graph.microsoft.com/v1.0/me/mailFolders",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                for folder in data.get("value", []):
+                    folder_map[folder["displayName"].lower()] = folder["id"]
+        except Exception as e:
+            errors.append(f"Failed to fetch folder list: {str(e)}")
+            # Continue anyway, we'll try to create folders as needed
+
+        # Process each email
+        for email in other_emails:
+            try:
+                # Get target folder name from category
+                target_folder_name = category_folder_map.get(email.category_id)
+                if not target_folder_name:
+                    errors.append(f"No folder mapping for category {email.category_id}")
+                    continue
+
+                target_folder_lower = target_folder_name.lower()
+
+                # Check if folder exists, create if not
+                if target_folder_lower not in folder_map:
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            create_response = await client.post(
+                                f"https://graph.microsoft.com/v1.0/me/mailFolders",
+                                headers={
+                                    "Authorization": f"Bearer {access_token}",
+                                    "Content-Type": "application/json"
+                                },
+                                json={"displayName": target_folder_name}
+                            )
+                            create_response.raise_for_status()
+                            new_folder = create_response.json()
+                            folder_map[target_folder_lower] = new_folder["id"]
+                    except Exception as e:
+                        errors.append(f"Failed to create folder '{target_folder_name}': {str(e)}")
+                        continue
+
+                # Move email to folder
+                folder_id = folder_map[target_folder_lower]
+                try:
+                    async with httpx.AsyncClient() as client:
+                        move_response = await client.post(
+                            f"https://graph.microsoft.com/v1.0/me/messages/{email.message_id}/move",
+                            headers={
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "application/json"
+                            },
+                            json={"destinationId": folder_id}
+                        )
+
+                        if move_response.status_code == 404:
+                            errors.append(f"Email {email.id} not found in Outlook (may have been deleted)")
+                        else:
+                            move_response.raise_for_status()
+                            moved_count += 1
+                except Exception as e:
+                    errors.append(f"Failed to move email {email.id}: {str(e)}")
+                    continue
+
+                # Mark as actioned
+                email.status = "actioned"
+                confirmed_count += 1
+
+            except Exception as e:
+                errors.append(f"Error processing email {email.id}: {str(e)}")
+                continue
+
+        # Commit all updates
+        db.commit()
+
+        return {
+            "confirmed": confirmed_count,
+            "moved": moved_count,
+            "errors": errors,
+            "message": f"Confirmed {confirmed_count} Other emails. Moved {moved_count} to folders."
+        }
+
+    except Exception as e:
+        error_message = str(e)
+        if "Token expired" in error_message or "re-authenticate" in error_message:
+            raise HTTPException(status_code=401, detail=error_message)
+        raise HTTPException(status_code=500, detail=f"Bulk confirm failed: {error_message}")
+
+
+@router.post("/reassign-dates")
+async def reassign_due_dates(db: Session = Depends(get_db)):
+    """
+    Re-run due date assignment on existing classified emails.
+    
+    Uses the new duration-aware, calendar-intelligent assignment algorithm.
+    This will:
+    1. Estimate durations for all Work emails (if not already done)
+    2. Fetch calendar availability
+    3. Re-assign due dates based on actual available time and task durations
+    
+    Returns:
+        Assignment summary
+    """
+    from app.services.duration_estimator import estimate_task_duration, apply_calibration
+    from app.services.calendar_service import get_daily_capacity_minutes
+    from app.services.assignment import assign_due_dates_duration_aware, get_assignment_summary
+    from app.services.scoring import URGENCY_FLOOR_THRESHOLD, TIME_PRESSURE_THRESHOLD
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    # Get user
+    user = db.query(User).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    try:
+        # Get access token for calendar
+        graph_client = GraphClient()
+        access_token = await graph_client.get_token(user.email, db)
+        
+        # Get Work category IDs
+        work_category_ids = get_work_category_ids(db)
+        
+        # Step 1: Estimate durations for emails that don't have estimates
+        emails_to_estimate = db.query(Email).filter(
+            Email.status == "classified",
+            Email.category_id.in_(work_category_ids),
+            Email.duration_estimate.is_(None)
+        ).all()
+        
+        estimated_count = 0
+        for email in emails_to_estimate:
+            try:
+                category = db.query(Category).filter(Category.id == email.category_id).first()
+                raw_estimate, reasoning = await estimate_task_duration(email, category, db)
+                calibrated_estimate = apply_calibration(raw_estimate, db, user.id if user else None)
+                email.duration_estimate = calibrated_estimate
+                estimated_count += 1
+            except Exception as e:
+                logger.error(f"Duration estimation failed for email {email.id}: {e}")
+                email.duration_estimate = 10  # Fallback
+        
+        db.commit()
+        logger.info(f"Estimated durations for {estimated_count} emails")
+        
+        # Step 2: Fetch all scored Work emails
+        scored_emails_db = db.query(Email, UrgencyScore).join(
+            UrgencyScore, Email.id == UrgencyScore.email_id
+        ).filter(
+            Email.status == "classified",
+            Email.category_id.in_(work_category_ids),
+            Email.urgency_score.isnot(None)
+        ).order_by(
+            UrgencyScore.urgency_score.desc()
+        ).all()
+        
+        if not scored_emails_db:
+            return {
+                "reassigned": 0,
+                "message": "No classified Work emails to reassign"
+            }
+        
+        # Convert to format for assignment
+        scored_emails = []
+        for email, urgency in scored_emails_db:
+            scored_emails.append({
+                "email_id": email.id,
+                "urgency_score": urgency.urgency_score,
+                "floor_override": urgency.floor_override,
+                "force_today": urgency.force_today,
+                "duration_estimate": email.duration_estimate or 10
+            })
+        
+        # Step 3: Fetch calendar capacity in minutes
+        calendar_capacity_minutes = await get_daily_capacity_minutes(access_token, days_ahead=14)
+        
+        # Step 4: Run duration-aware assignment
+        settings = {
+            "urgency_floor": URGENCY_FLOOR_THRESHOLD,
+            "time_pressure_threshold": TIME_PRESSURE_THRESHOLD,
+            "fallback_daily_minutes": 480
+        }
+        
+        logger.info("Re-running assignment with duration-aware algorithm")
+        assignments = assign_due_dates_duration_aware(scored_emails, calendar_capacity_minutes, settings)
+        
+        # Step 5: Update database with new assignments
+        for assignment in assignments:
+            email = db.query(Email).filter(Email.id == assignment["email_id"]).first()
+            if email:
+                if assignment["due_date"]:
+                    due_date_str = assignment["due_date"]
+                    email.due_date = datetime.strptime(due_date_str, "%Y-%m-%d")
+                else:
+                    email.due_date = None
+        
+        db.commit()
+        
+        # Generate summary
+        summary = get_assignment_summary(assignments)
+        
+        return {
+            "status": "success",
+            "reassigned": len(assignments),
+            "estimated_durations": estimated_count,
+            "slots": {
+                "today": summary['by_slot']['today'],
+                "tomorrow": summary['by_slot']['tomorrow'],
+                "this_week": summary['by_slot']['this_week'],
+                "next_week": summary['by_slot']['next_week'],
+                "no_date": summary['by_slot']['no_date']
+            },
+            "message": f"Re-assigned {len(assignments)} emails using calendar-aware duration algorithm"
+        }
+        
+    except Exception as e:
+        logger.error(f"Re-assignment failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to reassign dates: {str(e)}")
+
+
+class BatchMoveRequest(BaseModel):
+    category_id: int
+
+
+class BatchDeleteRequest(BaseModel):
+    category_id: int
+
+
+@router.post("/batch-move-to-folder")
+async def batch_move_to_folder(
+    request: BatchMoveRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Batch move all emails in a category to their corresponding folder.
+
+    This endpoint is used for Marketing (8), Notifications (9), Calendar Items (10), and Travel (12)
+    to quickly move all emails to folders named exactly as their category labels:
+    - "8. Marketing"
+    - "9. Notifications"
+    - "10. Calendar Items"
+    - "12. Travel"
+
+    Args:
+        request: Contains category_id (8, 9, 10, or 12)
+        db: Database session
+
+    Returns:
+        dict: Count of moved emails
+    """
+    # Get the authenticated user
+    user = db.query(User).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please log in first.")
+
+    try:
+        # Get the category
+        category = db.query(Category).filter(Category.number == request.category_id).first()
+        if not category:
+            raise HTTPException(status_code=400, detail=f"Category {request.category_id} not found")
+
+        # Verify it's one of the batch-processable categories
+        if request.category_id not in [8, 9, 10, 12]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Batch move only available for categories 8, 9, 10, and 12"
+            )
+
+        # Get all emails in this category with status='classified'
+        emails = db.query(Email).filter(
+            Email.category_id == category.id,
+            Email.status == "classified"
+        ).all()
+
+        if not emails:
+            return {
+                "moved": 0,
+                "message": f"No emails to move in category {category.label}"
+            }
+
+        # Get access token
+        graph_client = GraphClient()
+        access_token = await graph_client.get_token(user.email, db)
+
+        # Build folder map
+        folder_map = {}
+        inbox_folder_id = None
+
+        async with httpx.AsyncClient() as client:
+            # Get top-level folders
+            response = await client.get(
+                f"https://graph.microsoft.com/v1.0/me/mailFolders",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            for folder in data.get("value", []):
+                folder_name = folder["displayName"]
+                folder_id = folder["id"]
+                folder_map[folder_name.lower()] = folder_id
+
+                # Save Inbox folder ID for creating subfolders
+                if folder_name == "Inbox":
+                    inbox_folder_id = folder_id
+
+                    # Fetch child folders of Inbox
+                    try:
+                        child_response = await client.get(
+                            f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/childFolders",
+                            headers={"Authorization": f"Bearer {access_token}"}
+                        )
+                        if child_response.status_code == 200:
+                            for child in child_response.json().get("value", []):
+                                folder_map[child["displayName"].lower()] = child["id"]
+                    except Exception:
+                        pass
+
+        # Determine target folder name (number prefix + label, e.g., "8. Marketing")
+        target_folder_name = f"{category.number}. {category.label}"
+        target_folder_lower = target_folder_name.lower()
+
+        # Check if folder exists, create if not
+        if target_folder_lower not in folder_map:
+            async with httpx.AsyncClient() as client:
+                # Create folder under Inbox
+                create_response = await client.post(
+                    f"https://graph.microsoft.com/v1.0/me/mailFolders/{inbox_folder_id}/childFolders" if inbox_folder_id else f"https://graph.microsoft.com/v1.0/me/mailFolders",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json"
+                    },
+                    json={"displayName": target_folder_name}
+                )
+
+                if create_response.status_code in [200, 201]:
+                    new_folder = create_response.json()
+                    folder_map[target_folder_lower] = new_folder["id"]
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to create folder '{target_folder_name}'"
+                    )
+
+        # Move all emails to the target folder
+        moved_count = 0
+        errors = []
+
+        async with httpx.AsyncClient() as client:
+            for email in emails:
+                try:
+                    move_response = await client.post(
+                        f"https://graph.microsoft.com/v1.0/me/messages/{email.message_id}/move",
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json"
+                        },
+                        json={"destinationId": folder_map[target_folder_lower]}
+                    )
+
+                    if move_response.status_code in [200, 201]:
+                        # Update database
+                        email.folder = target_folder_name
+                        email.status = "actioned"
+                        moved_count += 1
+                    elif move_response.status_code == 404:
+                        errors.append(f"Email {email.id} not found (may have been deleted)")
+                    else:
+                        errors.append(f"Failed to move email {email.id}: {move_response.status_code}")
+                except Exception as e:
+                    errors.append(f"Error moving email {email.id}: {str(e)}")
+
+        # Record action for undo (before commit)
+        if moved_count > 0:
+            email_ids = [email.id for email in emails if email.status == "actioned"]
+            description = f"Batch moved {moved_count} email{'s' if moved_count != 1 else ''} to {target_folder_name}"
+            record_action(
+                db,
+                action_type="batch_move",
+                description=description,
+                action_data={
+                    "category_id": request.category_id,
+                    "category_label": category.label,
+                    "folder_name": target_folder_name,
+                    "email_ids": email_ids,
+                    "moved_count": moved_count
+                },
+                user_id=user.id
+            )
+
+        # Commit database changes
+        db.commit()
+
+        return {
+            "moved": moved_count,
+            "errors": errors if errors else None,
+            "message": f"Moved {moved_count} email{'s' if moved_count != 1 else ''} to {target_folder_name}"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch move failed: {str(e)}")
+
+
+@router.post("/batch-delete-category")
+async def batch_delete_category(
+    request: BatchDeleteRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Batch delete all emails in a category (move to trash).
+
+    This endpoint is used for Marketing (8), Notifications (9), Calendar Items (10), and Travel (12)
+    to quickly move all emails to the Deleted Items folder.
+
+    Args:
+        request: Contains category_id (8, 9, 10, or 12)
+        db: Database session
+
+    Returns:
+        dict: Count of deleted emails
+    """
+    # Get the authenticated user
+    user = db.query(User).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please log in first.")
+
+    try:
+        # Get the category
+        category = db.query(Category).filter(Category.number == request.category_id).first()
+        if not category:
+            raise HTTPException(status_code=400, detail=f"Category {request.category_id} not found")
+
+        # Verify it's one of the batch-processable categories
+        if request.category_id not in [8, 9, 10, 12]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Batch delete only available for categories 8, 9, 10, and 12"
+            )
+
+        # Get all emails in this category with status='classified'
+        emails = db.query(Email).filter(
+            Email.category_id == category.id,
+            Email.status == "classified"
+        ).all()
+
+        if not emails:
+            return {
+                "deleted": 0,
+                "message": f"No emails to delete in category {category.label}"
+            }
+
+        # Get access token
+        graph_client = GraphClient()
+        access_token = await graph_client.get_token(user.email, db)
+
+        # Get the Deleted Items folder ID
+        deleted_items_folder_id = None
+
+        async with httpx.AsyncClient() as client:
+            # Get top-level folders
+            response = await client.get(
+                f"https://graph.microsoft.com/v1.0/me/mailFolders",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            for folder in data.get("value", []):
+                # Look for "Deleted Items" or "Trash"
+                if folder["displayName"].lower() in ["deleted items", "trash", "deleted"]:
+                    deleted_items_folder_id = folder["id"]
+                    break
+
+        if not deleted_items_folder_id:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not find Deleted Items folder"
+            )
+
+        # Move all emails to trash
+        deleted_count = 0
+        errors = []
+
+        async with httpx.AsyncClient() as client:
+            for email in emails:
+                try:
+                    move_response = await client.post(
+                        f"https://graph.microsoft.com/v1.0/me/messages/{email.message_id}/move",
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json"
+                        },
+                        json={"destinationId": deleted_items_folder_id}
+                    )
+
+                    if move_response.status_code in [200, 201]:
+                        # Update database
+                        email.folder = "deleted"
+                        email.status = "actioned"
+                        deleted_count += 1
+                    elif move_response.status_code == 404:
+                        errors.append(f"Email {email.id} not found (may have been deleted)")
+                    else:
+                        errors.append(f"Failed to delete email {email.id}: {move_response.status_code}")
+                except Exception as e:
+                    errors.append(f"Error deleting email {email.id}: {str(e)}")
+
+        # Record action for undo (before commit)
+        if deleted_count > 0:
+            email_ids = [email.id for email in emails if email.status == "actioned"]
+            description = f"Batch deleted {deleted_count} email{'s' if deleted_count != 1 else ''} from {category.label}"
+            record_action(
+                db,
+                action_type="batch_delete",
+                description=description,
+                action_data={
+                    "category_id": request.category_id,
+                    "category_label": category.label,
+                    "email_ids": email_ids,
+                    "deleted_count": deleted_count
+                },
+                user_id=user.id
+            )
+
+        # Commit database changes
+        db.commit()
+
+        return {
+            "deleted": deleted_count,
+            "errors": errors if errors else None,
+            "message": f"Moved {deleted_count} email{'s' if deleted_count != 1 else ''} to trash"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch delete failed: {str(e)}")

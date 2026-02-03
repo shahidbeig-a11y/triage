@@ -9,6 +9,7 @@ class Email(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     message_id = Column(String, unique=True, index=True, nullable=False)
+    immutable_id = Column(String, unique=True, index=True, nullable=True)  # Stays constant across folder moves
     from_address = Column(String, nullable=False)
     from_name = Column(String)
     subject = Column(String)
@@ -29,6 +30,12 @@ class Email(Base):
     urgency_score = Column(Float)  # 0.0 to 1.0
     due_date = Column(DateTime, nullable=True)
     todo_task_id = Column(String, nullable=True)  # Microsoft To-Do task ID
+    assigned_to = Column(String, nullable=True)  # Person name for Discuss/Delegate
+    duration_estimate = Column(Integer, default=30)  # AI-estimated duration in minutes
+
+    # Timing fields for calibration
+    approved_at = Column(DateTime, nullable=True)  # When user approved
+    executed_at = Column(DateTime, nullable=True)  # When user executed/completed
 
     # Urgency score relationship
     urgency_score_record = relationship("UrgencyScore", back_populates="email", uselist=False)
@@ -36,6 +43,10 @@ class Email(Base):
     # Status fields
     folder = Column(String, default="inbox")  # inbox, archive, deleted
     status = Column(String, default="unprocessed")  # unprocessed, processed, archived
+
+    # Folder intelligence (for FYI - Group emails)
+    recommended_folder = Column(String, nullable=True)  # AI-recommended folder
+    folder_is_new = Column(Boolean, default=False)  # Whether folder needs to be created
 
     def __repr__(self):
         return f"<Email(id={self.id}, subject='{self.subject}', from='{self.from_address}')>"
